@@ -3,12 +3,12 @@
 Use the wrapper script unless the CLI is already installed globally:
 
 ```bash
-export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-export PWCLI="$CODEX_HOME/skills/playwright/scripts/playwright_cli.sh"
+export PW_SKILL_DIR="$(git rev-parse --show-toplevel)/.agents/skills/playwright"
+export PWCLI="$PW_SKILL_DIR/scripts/playwright_cli.sh"
 "$PWCLI" --help
 ```
 
-User-scoped skills install under `$CODEX_HOME/skills` (default: `~/.codex/skills`).
+This repository-scoped skill lives under `$REPO_ROOT/.agents/skills/playwright`.
 
 Optional convenience alias:
 
