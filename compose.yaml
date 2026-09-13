@@ -1,0 +1,80 @@
+name: ec-learning
+
+x-database: &database
+  image: postgres:18-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
+  environment:
+    POSTGRES_USER: ec
+    POSTGRES_PASSWORD: local-learning-only
+    POSTGRES_DB: ec
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ec -d ec"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+
+services:
+  db:
+    <<: *database
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://ec:local-learning-only@db:5432/ec?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    image: postgres:18-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
+    environment:
+      PGPASSWORD: local-learning-only
+    volumes:
+      - ./db/migrations:/migrations:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["psql", "-h", "db", "-U", "ec", "-d", "ec", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/002_orders.sql", "-f", "/migrations/003_cart_order_items.sql"]
+
+  web:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/products', {signal: AbortSignal.timeout(5000)}).then(r => {if (!r.ok) process.exit(1)}).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 6s
+      start_period: 15s
+      retries: 12
+
+  test-db:
+    <<: *database
+    profiles: ["test"]
+    tmpfs:
+      - /var/lib/postgresql
+    volumes:
+      - ./db/init/001_products.sql:/docker-entrypoint-initdb.d/001_products.sql:ro
+      - ./db/migrations/002_orders.sql:/docker-entrypoint-initdb.d/002_orders.sql:ro
+      - ./db/migrations/003_cart_order_items.sql:/docker-entrypoint-initdb.d/003_cart_order_items.sql:ro
+
+  api-test:
+    volumes:
+      - ./db:/schema:ro
+    profiles: ["test"]
+    build:
+      context: ./backend
+      target: source
+    environment:
+      TEST_DATABASE_URL: postgres://ec:local-learning-only@test-db:5432/ec?sslmode=disable
+    depends_on:
+      test-db:
+        condition: service_healthy
+    command: ["sh", "-ec", "test -z \"$$(gofmt -l .)\"; go test -mod=readonly -race -v ./...; go vet -mod=readonly ./...; go build -mod=readonly -o /tmp/api ."]
+
+volumes:
+  pgdata:
