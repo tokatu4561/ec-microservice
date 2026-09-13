@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  learning-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Go tests, cart concurrency, migration, race, vet and build
+        run: docker compose --profile test run --build --rm api-test
+      - name: Frontend typecheck, lint and production build
+        run: docker compose build web
+      - name: Start application and check database connectivity through Next.js
+        run: docker compose up --build --wait --wait-timeout 120
+      - name: Verify anonymous carts, multi-item checkout, failures and legacy API
+        run: python3 scripts/smoke.py
+      - name: Show logs
+        if: always()
+        run: docker compose --profile test logs --no-color --tail 100
+      - name: Stop CI environment
+        if: always()
+        run: docker compose --profile test down --volumes
