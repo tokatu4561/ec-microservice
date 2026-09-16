@@ -195,47 +195,6 @@ func TestOrderOutcomesPostgres(t *testing.T) {
 	}
 }
 
-func TestConcurrentOrdersPostgres(t *testing.T) {
-	s, id := orderFixture(t, 1)
-	start := make(chan struct{})
-	type result struct {
-		order Order
-		err   error
-	}
-	results := make(chan result, 2)
-	for range 2 {
-		go func() {
-			<-start
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			o, err := s.CreateOrder(ctx, fmt.Sprintf("%x", randomID()), OrderInput{ProductID: id, Quantity: 1})
-			results <- result{o, err}
-		}()
-	}
-	close(start)
-	success, failed := 0, 0
-	for range 2 {
-		r := <-results
-		if r.err != nil {
-			t.Fatal(r.err)
-		}
-		if r.order.Status == "shipping_requested" {
-			success++
-		}
-		if r.order.Status == "failed" && r.order.FailureReason != nil && *r.order.FailureReason == "out_of_stock" {
-			failed++
-		}
-	}
-	if success != 1 || failed != 1 {
-		t.Fatalf("success=%d failed=%d", success, failed)
-	}
-	checkStock(t, s, id, 0)
-	var count int
-	if err := s.pool.QueryRow(context.Background(), `SELECT count(*) FROM order_items WHERE product_id=$1`, id).Scan(&count); err != nil || count != 2 {
-		t.Fatalf("saved orders=%d err=%v", count, err)
-	}
-}
-
 func TestOrderRollbackPostgres(t *testing.T) {
 	s, id := orderFixture(t, 3)
 	// テスト専用DBのトリガーで、在庫UPDATE後の注文INSERTを失敗させる。

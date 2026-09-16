@@ -17,6 +17,12 @@
 細かな実装検討は会話、必要な引継ぎはIssueコメント、実際の変更と検証結果はPRにまとめます。
 コードに現れない設計判断のwhyは[ADR](docs/adr/)に残します。
 
+[学習2 #3](https://github.com/tokatu4561/ec-microservice/issues/3)は、実施済みの範囲で完了しました。
+[同時注文と悲観ロックの実験](docs/learning2-concurrency.md)では、在庫10への同時注文20件の整合性と、DBで観測するロック待ちを扱います。
+[負荷試験とSQL一括化の比較](docs/learning2-load.md)では、k6で変更前後の処理件数・待ち時間と在庫の正しさを確認しました。
+残りの競合制御・過負荷・キャンセル検証は[AWSデプロイ後の検証 #10](https://github.com/tokatu4561/ec-microservice/issues/10)へ引き継いでいます。
+次の学習は[学習3：注文フローのサービス分割 #4](https://github.com/tokatu4561/ec-microservice/issues/4)です。
+
 実装・検証後は、親エージェントが[レビュー担当](.codex/agents/reviewer.toml)を起動し、結果を受け取ります。
 毎回のレビュー依頼や、指摘の手動コピーは原則不要です。修正・再検証は親が担当します。
 親がIssueの要件と検証結果をreviewerに渡すため、ローカルの計画ファイルは不要です。
