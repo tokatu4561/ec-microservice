@@ -7,6 +7,14 @@ COPY . .
 FROM source AS build
 RUN CGO_ENABLED=0 go build -trimpath -o /api .
 
+FROM source AS load-build
+RUN CGO_ENABLED=0 go test -c -o /load-api .
+
+FROM scratch AS load-runtime
+COPY --from=load-build /load-api /load-api
+USER 65532:65532
+ENTRYPOINT ["/load-api", "-test.run=^TestLoadServer$", "-test.timeout=0"]
+
 FROM scratch AS runtime
 COPY --from=build /api /api
 USER 65532:65532

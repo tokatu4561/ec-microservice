@@ -146,18 +146,37 @@ func createOrderTx(ctx context.Context, tx pgx.Tx, id string, items []ItemInput,
 	sort.Slice(items, func(i, j int) bool { return items[i].ProductID < items[j].ProductID })
 	o := Order{ID: id, Items: []OrderItem{}, Status: "failed", PaymentStatus: "not_started", ShippingStatus: "not_started"}
 	shortage := false
+	ids := make([]int64, len(items))
 	for i, in := range items {
 		if in.ProductID <= 0 || in.Quantity <= 0 || in.Quantity > 2147483647 || (i > 0 && items[i-1].ProductID == in.ProductID) {
 			return Order{}, errInvalid
 		}
+		ids[i] = in.ProductID
+	}
+	// 全商品を一度で取得する。行ロックは従来と同じ商品ID昇順で取得する。
+	rows, err := tx.Query(ctx, `SELECT id,name,price_yen,stock FROM products WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE`, ids)
+	if err != nil {
+		return Order{}, err
+	}
+	products := make([]Product, 0, len(items))
+	for rows.Next() {
 		var p Product
-		err := tx.QueryRow(ctx, `SELECT id,name,price_yen,stock FROM products WHERE id=$1 FOR UPDATE`, in.ProductID).Scan(&p.ID, &p.Name, &p.PriceYen, &p.Stock)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return Order{}, errNotFound
-		}
-		if err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.PriceYen, &p.Stock); err != nil {
+			rows.Close()
 			return Order{}, err
 		}
+		products = append(products, p)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return Order{}, err
+	}
+	if len(products) != len(items) {
+		return Order{}, errNotFound
+	}
+	for i, p := range products {
+		in := items[i]
 		item := OrderItem{ProductID: p.ID, ProductName: p.Name, Quantity: in.Quantity, PriceYen: p.PriceYen, StockShortage: p.Stock < in.Quantity}
 		item.SubtotalYen, err = addAmount(&o.TotalYen, p.PriceYen, in.Quantity)
 		if err != nil {
@@ -171,10 +190,8 @@ func createOrderTx(ctx context.Context, tx pgx.Tx, id string, items []ItemInput,
 	if shortage {
 		reason = "out_of_stock"
 	} else {
-		for _, item := range o.Items {
-			if _, err := tx.Exec(ctx, `UPDATE products SET stock=stock-$1 WHERE id=$2`, item.Quantity, item.ProductID); err != nil {
-				return Order{}, err
-			}
+		if err := adjustOrderStock(ctx, tx, o.Items, -1); err != nil {
+			return Order{}, err
 		}
 		orderStep(ctx, id, "stock_reserved_in_transaction")
 		if payment == "fail" {
@@ -192,10 +209,8 @@ func createOrderTx(ctx context.Context, tx pgx.Tx, id string, items []ItemInput,
 			}
 		}
 		if reason != "" {
-			for _, item := range o.Items {
-				if _, err := tx.Exec(ctx, `UPDATE products SET stock=stock+$1 WHERE id=$2`, item.Quantity, item.ProductID); err != nil {
-					return Order{}, err
-				}
+			if err := adjustOrderStock(ctx, tx, o.Items, 1); err != nil {
+				return Order{}, err
 			}
 			orderStep(ctx, id, "stock_restored_in_transaction")
 		}
@@ -203,14 +218,33 @@ func createOrderTx(ctx context.Context, tx pgx.Tx, id string, items []ItemInput,
 	if reason != "" {
 		o.FailureReason = &reason
 	}
-	err := tx.QueryRow(ctx, `INSERT INTO orders(id,status,failure_reason,payment_status,shipping_status) VALUES($1,$2,$3,$4,$5) RETURNING created_at`, id, o.Status, o.FailureReason, o.PaymentStatus, o.ShippingStatus).Scan(&o.CreatedAt)
+	err = tx.QueryRow(ctx, `INSERT INTO orders(id,status,failure_reason,payment_status,shipping_status) VALUES($1,$2,$3,$4,$5) RETURNING created_at`, id, o.Status, o.FailureReason, o.PaymentStatus, o.ShippingStatus).Scan(&o.CreatedAt)
 	if err != nil {
 		return Order{}, err
 	}
-	for _, item := range o.Items {
-		if _, err = tx.Exec(ctx, `INSERT INTO order_items(order_id,product_id,product_name,quantity,price_yen,stock_shortage) VALUES($1,$2,$3,$4,$5,$6)`, id, item.ProductID, item.ProductName, item.Quantity, item.PriceYen, item.StockShortage); err != nil {
-			return Order{}, err
-		}
+	names := make([]string, len(o.Items))
+	quantities := make([]int32, len(o.Items))
+	prices := make([]int64, len(o.Items))
+	shortages := make([]bool, len(o.Items))
+	for i, item := range o.Items {
+		names[i], quantities[i], prices[i], shortages[i] = item.ProductName, int32(item.Quantity), item.PriceYen, item.StockShortage
 	}
-	return o, nil
+	_, err = tx.Exec(ctx, `INSERT INTO order_items(order_id,product_id,product_name,quantity,price_yen,stock_shortage)
+		SELECT $1,product_id,product_name,quantity,price_yen,stock_shortage
+		FROM unnest($2::bigint[],$3::text[],$4::integer[],$5::bigint[],$6::boolean[])
+		AS item(product_id,product_name,quantity,price_yen,stock_shortage) ORDER BY product_id`,
+		id, ids, names, quantities, prices, shortages)
+	return o, err
+}
+
+// 呼出前に全商品のロックを取得済み。在庫確保と模擬失敗時の復元を同じSQLで扱う。
+func adjustOrderStock(ctx context.Context, tx pgx.Tx, items []OrderItem, direction int32) error {
+	ids := make([]int64, len(items))
+	deltas := make([]int32, len(items))
+	for i, item := range items {
+		ids[i], deltas[i] = item.ProductID, int32(item.Quantity)*direction
+	}
+	_, err := tx.Exec(ctx, `UPDATE products p SET stock=p.stock+i.delta
+		FROM unnest($1::bigint[],$2::integer[]) AS i(product_id,delta) WHERE p.id=i.product_id`, ids, deltas)
+	return err
 }

@@ -1,0 +1,53 @@
+name: ec-learning-load
+
+services:
+  db:
+    image: postgres:18-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
+    environment:
+      POSTGRES_USER: ec
+      POSTGRES_PASSWORD: local-load-only
+      POSTGRES_DB: ec_load
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "track_io_timing=on", "-c", "max_connections=40"]
+    cpus: 2
+    mem_limit: 2g
+    tmpfs:
+      - /var/lib/postgresql
+    volumes:
+      - ./db/init/001_products.sql:/docker-entrypoint-initdb.d/001_products.sql:ro
+      - ./db/migrations/002_orders.sql:/docker-entrypoint-initdb.d/002_orders.sql:ro
+      - ./db/migrations/003_cart_order_items.sql:/docker-entrypoint-initdb.d/003_cart_order_items.sql:ro
+      - ./load:/experiment:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ec -d ec_load"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  api:
+    build:
+      context: ./backend
+      target: load-runtime
+    environment:
+      LEARNING_LOAD: "1"
+      ORDER_VARIANT: ${ORDER_VARIANT:-current}
+      TEST_DATABASE_URL: postgres://ec:local-load-only@db:5432/ec_load?sslmode=disable&pool_max_conns=10
+    cpus: 2
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:${LOAD_PORT:-18080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+  k6:
+    image: grafana/k6:1.7.1@sha256:4fd3a694926b064d3491d9b02b01cde886583c4931f1223816e3d9a7bdfa7e0f
+    profiles: ["tools"]
+    cpus: 2
+    mem_limit: 512m
+    environment:
+      VUS: ${VUS:-1}
+      DURATION: ${DURATION:-30s}
+      ITEMS: ${ITEMS:-20}
+      WORKLOAD: ${WORKLOAD:-shared}
+    volumes:
+      - ./load:/scripts:ro
+      - ${LOAD_RESULTS_DIR:-./output/load}:/results
+    command: ["run", "--quiet", "/scripts/orders.js"]
