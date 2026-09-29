@@ -13,6 +13,265 @@ x-database: &database
     retries: 20
 
 services:
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.11.0@sha256:b585df1b6299bbbd16bf7c679da30389349736e4b6bc8f4f500142a75bf26ca8
+    ports:
+      - "127.0.0.1:${JAEGER_PORT:-16686}:16686"
+
+  payment-db:
+    <<: *database
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment-local-learning-only
+      POSTGRES_DB: payment
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [payment-data]
+    volumes:
+      - payment-pgdata:/var/lib/postgresql
+
+  payment:
+    build: ./payment
+    environment:
+      DATABASE_URL: postgres://payment:payment-local-learning-only@payment-db:5432/payment?sslmode=disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    ports:
+      - "127.0.0.1:${PAYMENT_PORT:-8081}:8080"
+    networks: [default, payment-data]
+    depends_on:
+      payment-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/payment", "-healthcheck"]
+      interval: 5s
+      timeout: 5s
+      start_period: 5s
+      retries: 12
+
+  payment-test-db:
+    <<: *database
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment-test-only
+      POSTGRES_DB: payment_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [payment-test-data]
+    tmpfs:
+      - /var/lib/postgresql
+
+  payment-test:
+    profiles: ["test"]
+    build:
+      context: ./payment
+      target: source
+    environment:
+      TEST_DATABASE_URL: postgres://payment:payment-test-only@payment-test-db:5432/payment_test?sslmode=disable
+    networks: [payment-test-data]
+    depends_on:
+      payment-test-db:
+        condition: service_healthy
+    command: ["sh", "-ec", "test -z \"$$(gofmt -l .)\"; go test -mod=readonly -race -v ./...; go vet -mod=readonly ./...; go build -mod=readonly -o /tmp/payment ."]
+
+  payment-test-server:
+    profiles: ["test"]
+    build: ./payment
+    environment:
+      DATABASE_URL: postgres://payment:payment-test-only@payment-test-db:5432/payment_test?sslmode=disable
+    networks: [default, payment-test-data]
+    depends_on:
+      payment-test-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/payment", "-healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  shipping-db:
+    <<: *database
+    environment:
+      POSTGRES_USER: shipping
+      POSTGRES_PASSWORD: shipping-local-learning-only
+      POSTGRES_DB: shipping
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shipping -d shipping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [shipping-data]
+    volumes:
+      - shipping-pgdata:/var/lib/postgresql
+
+  shipping:
+    build: ./shipping
+    environment:
+      DATABASE_URL: postgres://shipping:shipping-local-learning-only@shipping-db:5432/shipping?sslmode=disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    ports:
+      - "127.0.0.1:${SHIPPING_PORT:-8083}:8080"
+    networks: [default, shipping-data]
+    depends_on:
+      shipping-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/shipping", "-healthcheck"]
+      interval: 5s
+      timeout: 5s
+      start_period: 5s
+      retries: 12
+
+  shipping-test-db:
+    <<: *database
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: shipping
+      POSTGRES_PASSWORD: shipping-test-only
+      POSTGRES_DB: shipping_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shipping -d shipping_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [shipping-test-data]
+    tmpfs:
+      - /var/lib/postgresql
+
+  shipping-test:
+    profiles: ["test"]
+    build:
+      context: ./shipping
+      target: source
+    environment:
+      TEST_DATABASE_URL: postgres://shipping:shipping-test-only@shipping-test-db:5432/shipping_test?sslmode=disable
+    networks: [shipping-test-data]
+    depends_on:
+      shipping-test-db:
+        condition: service_healthy
+    command: ["sh", "-ec", "test -z \"$$(gofmt -l .)\"; go test -mod=readonly -race -v ./...; go vet -mod=readonly ./...; go build -mod=readonly -o /tmp/shipping ."]
+
+  shipping-test-server:
+    profiles: ["test"]
+    build: ./shipping
+    environment:
+      DATABASE_URL: postgres://shipping:shipping-test-only@shipping-test-db:5432/shipping_test?sslmode=disable
+    networks: [default, shipping-test-data]
+    depends_on:
+      shipping-test-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/shipping", "-healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  inventory-db:
+    <<: *database
+    environment:
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: inventory-local-learning-only
+      POSTGRES_DB: inventory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory -d inventory"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [inventory-data]
+    volumes:
+      - inventory-pgdata:/var/lib/postgresql
+
+  inventory:
+    build: ./inventory
+    environment:
+      DATABASE_URL: postgres://inventory:inventory-local-learning-only@inventory-db:5432/inventory?sslmode=disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    ports:
+      - "127.0.0.1:${INVENTORY_PORT:-8086}:8080"
+    networks: [default, inventory-data]
+    depends_on:
+      inventory-db:
+        condition: service_healthy
+      inventory-import:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/inventory", "-healthcheck"]
+      interval: 5s
+      timeout: 5s
+      start_period: 5s
+      retries: 12
+
+  inventory-test-db:
+    <<: *database
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: inventory-test-only
+      POSTGRES_DB: inventory_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory -d inventory_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [inventory-test-data]
+    volumes:
+      - ./inventory/migrations/001_inventory.sql:/docker-entrypoint-initdb.d/001_inventory.sql:ro
+      - ./inventory/testdata/seed.sql:/docker-entrypoint-initdb.d/002_seed.sql:ro
+    tmpfs:
+      - /var/lib/postgresql
+
+  inventory-test:
+    volumes:
+      - ./db:/schema:ro
+    profiles: ["test"]
+    build:
+      context: ./inventory
+      target: source
+    environment:
+      TEST_DATABASE_URL: postgres://inventory:inventory-test-only@inventory-test-db:5432/inventory_test?sslmode=disable
+      TEST_SOURCE_DATABASE_URL: postgres://ec:local-learning-only@test-db:5432/ec?sslmode=disable
+    networks: [default, inventory-test-data]
+    depends_on:
+      test-db:
+        condition: service_healthy
+      inventory-test-db:
+        condition: service_healthy
+    command: ["sh", "-ec", "test -z \"$$(gofmt -l .)\"; go test -mod=readonly -race -v ./...; go vet -mod=readonly ./...; go build -mod=readonly -o /tmp/inventory ."]
+
+  inventory-test-server:
+    profiles: ["test"]
+    build: ./inventory
+    environment:
+      DATABASE_URL: postgres://inventory:inventory-test-only@inventory-test-db:5432/inventory_test?sslmode=disable
+    networks: [default, inventory-test-data]
+    depends_on:
+      inventory-test-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/inventory", "-healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  inventory-import:
+    build: ./inventory
+    command: ["-import"]
+    environment:
+      SOURCE_DATABASE_URL: postgres://ec:local-learning-only@db:5432/ec?sslmode=disable
+      DATABASE_URL: postgres://inventory:inventory-local-learning-only@inventory-db:5432/inventory?sslmode=disable
+    networks: [default, inventory-data]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      inventory-db:
+        condition: service_healthy
+
   db:
     <<: *database
     volumes:
@@ -23,9 +282,19 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgres://ec:local-learning-only@db:5432/ec?sslmode=disable
+      PAYMENT_BASE_URL: http://payment:8080
+      SHIPPING_BASE_URL: http://shipping:8080
+      INVENTORY_BASE_URL: http://inventory:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       migrate:
         condition: service_completed_successfully
+      payment:
+        condition: service_healthy
+      shipping:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
 
   migrate:
     image: postgres:18-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
@@ -36,7 +305,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: ["psql", "-h", "db", "-U", "ec", "-d", "ec", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/002_orders.sql", "-f", "/migrations/003_cart_order_items.sql"]
+    command: ["psql", "-h", "db", "-U", "ec", "-d", "ec", "-v", "ON_ERROR_STOP=1", "-f", "/migrations/002_orders.sql", "-f", "/migrations/003_cart_order_items.sql", "-f", "/migrations/004_order_progress.sql", "-f", "/migrations/005_shipping_progress.sql", "-f", "/migrations/006_inventory_progress.sql"]
 
   web:
     build: ./frontend
@@ -62,7 +331,12 @@ services:
       - ./db/migrations/002_orders.sql:/docker-entrypoint-initdb.d/002_orders.sql:ro
       - ./db/migrations/003_cart_order_items.sql:/docker-entrypoint-initdb.d/003_cart_order_items.sql:ro
 
+      - ./db/migrations/004_order_progress.sql:/docker-entrypoint-initdb.d/004_order_progress.sql:ro
+      - ./db/migrations/005_shipping_progress.sql:/docker-entrypoint-initdb.d/005_shipping_progress.sql:ro
+      - ./db/migrations/006_inventory_progress.sql:/docker-entrypoint-initdb.d/006_inventory_progress.sql:ro
+
   api-test:
+    networks: [default, inventory-test-data]
     volumes:
       - ./db:/schema:ro
     profiles: ["test"]
@@ -71,10 +345,37 @@ services:
       target: source
     environment:
       TEST_DATABASE_URL: postgres://ec:local-learning-only@test-db:5432/ec?sslmode=disable
+      TEST_PAYMENT_URL: http://payment-test-server:8080
+      TEST_SHIPPING_URL: http://shipping-test-server:8080
+      TEST_INVENTORY_URL: http://inventory-test-server:8080
+      TEST_INVENTORY_DATABASE_URL: postgres://inventory:inventory-test-only@inventory-test-db:5432/inventory_test?sslmode=disable
     depends_on:
       test-db:
+        condition: service_healthy
+      payment-test-server:
+        condition: service_healthy
+      shipping-test-server:
+        condition: service_healthy
+      inventory-test-server:
         condition: service_healthy
     command: ["sh", "-ec", "test -z \"$$(gofmt -l .)\"; go test -mod=readonly -race -v ./...; go vet -mod=readonly ./...; go build -mod=readonly -o /tmp/api ."]
 
 volumes:
   pgdata:
+  payment-pgdata:
+  shipping-pgdata:
+  inventory-pgdata:
+
+networks:
+  payment-data:
+    internal: true
+  payment-test-data:
+    internal: true
+  shipping-data:
+    internal: true
+  shipping-test-data:
+    internal: true
+  inventory-data:
+    internal: true
+  inventory-test-data:
+    internal: true

@@ -14,7 +14,7 @@ func createOrderTxBaseline(ctx context.Context, tx pgx.Tx, id string, items []It
 	}
 	items = append([]ItemInput(nil), items...)
 	sort.Slice(items, func(i, j int) bool { return items[i].ProductID < items[j].ProductID })
-	o := Order{ID: id, Items: []OrderItem{}, Status: "failed", PaymentStatus: "not_started", ShippingStatus: "not_started"}
+	o := Order{ID: id, Items: []OrderItem{}, Status: "failed", PaymentStatus: "not_started", ShippingStatus: "not_started", InventoryStatus: "legacy"}
 	shortage := false
 	for i, in := range items {
 		if in.ProductID <= 0 || in.Quantity <= 0 || in.Quantity > 2147483647 || (i > 0 && items[i-1].ProductID == in.ProductID) {

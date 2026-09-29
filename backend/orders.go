@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,21 +53,22 @@ type OrderItem struct {
 	SubtotalYen   int64  `json:"subtotalYen"`
 }
 type Order struct {
-	ID             string      `json:"id"`
-	Items          []OrderItem `json:"items"`
-	TotalYen       int64       `json:"totalYen"`
-	Status         string      `json:"status"`
-	FailureReason  *string     `json:"failureReason"`
-	PaymentStatus  string      `json:"paymentStatus"`
-	ShippingStatus string      `json:"shippingStatus"`
-	CreatedAt      time.Time   `json:"createdAt"`
+	ID              string      `json:"id"`
+	Items           []OrderItem `json:"items"`
+	TotalYen        int64       `json:"totalYen"`
+	Status          string      `json:"status"`
+	FailureReason   *string     `json:"failureReason"`
+	PaymentStatus   string      `json:"paymentStatus"`
+	InventoryStatus string      `json:"inventoryStatus"`
+	ShippingStatus  string      `json:"shippingStatus"`
+	CreatedAt       time.Time   `json:"createdAt"`
 }
 
-const orderColumns = `id,status,failure_reason,payment_status,shipping_status,created_at`
+const orderColumns = `id,status,failure_reason,payment_status,shipping_status,inventory_status,created_at`
 
 func scanOrder(row pgx.Row) (Order, error) {
 	o := Order{Items: []OrderItem{}}
-	err := row.Scan(&o.ID, &o.Status, &o.FailureReason, &o.PaymentStatus, &o.ShippingStatus, &o.CreatedAt)
+	err := row.Scan(&o.ID, &o.Status, &o.FailureReason, &o.PaymentStatus, &o.ShippingStatus, &o.InventoryStatus, &o.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return o, errNotFound
 	}
@@ -110,14 +110,16 @@ func (s postgresStore) GetOrder(ctx context.Context, id string) (Order, error) {
 }
 func orderStep(ctx context.Context, id, event string) {
 	requestID, _ := ctx.Value(requestIDKey{}).(string)
-	slog.InfoContext(ctx, event, "request_id", requestID, "order_id", id)
+	slog.InfoContext(ctx, event, "service", "order", "request_id", requestID, "order_id", id)
 }
 func rollback(tx pgx.Tx) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = tx.Rollback(ctx)
 }
-func (s postgresStore) CreateOrder(ctx context.Context, id string, in OrderInput) (Order, error) {
+func (s postgresStore) CreateOrder(ctx context.Context, id string, in OrderInput) (out Order, resultErr error) {
+	ctx, span := startOperation(ctx, "order", "order.accept", id)
+	defer func() { finishOperation(span, resultErr) }()
 	if err := in.validate(); err != nil {
 		return Order{}, err
 	}
@@ -126,7 +128,7 @@ func (s postgresStore) CreateOrder(ctx context.Context, id string, in OrderInput
 		return Order{}, err
 	}
 	defer rollback(tx)
-	o, err := createOrderTx(ctx, tx, id, []ItemInput{{in.ProductID, in.Quantity}}, in.PaymentMode, in.ShippingMode)
+	o, err := reserveOrderTx(ctx, tx, id, []ItemInput{{in.ProductID, in.Quantity}}, in.PaymentMode, in.ShippingMode, "")
 	if err != nil {
 		return Order{}, err
 	}
@@ -134,117 +136,8 @@ func (s postgresStore) CreateOrder(ctx context.Context, id string, in OrderInput
 		return Order{}, err
 	}
 	orderStep(ctx, id, "order_committed")
-	return o, nil
-}
-
-// カート経由と旧単品APIで、同じ注文処理・同じロック順を使う。
-func createOrderTx(ctx context.Context, tx pgx.Tx, id string, items []ItemInput, payment, shipping string) (Order, error) {
-	if len(items) == 0 || len(items) > 100 {
-		return Order{}, errInvalid
+	if o.Status == "failed" {
+		return o, nil
 	}
-	items = append([]ItemInput(nil), items...)
-	sort.Slice(items, func(i, j int) bool { return items[i].ProductID < items[j].ProductID })
-	o := Order{ID: id, Items: []OrderItem{}, Status: "failed", PaymentStatus: "not_started", ShippingStatus: "not_started"}
-	shortage := false
-	ids := make([]int64, len(items))
-	for i, in := range items {
-		if in.ProductID <= 0 || in.Quantity <= 0 || in.Quantity > 2147483647 || (i > 0 && items[i-1].ProductID == in.ProductID) {
-			return Order{}, errInvalid
-		}
-		ids[i] = in.ProductID
-	}
-	// 全商品を一度で取得する。行ロックは従来と同じ商品ID昇順で取得する。
-	rows, err := tx.Query(ctx, `SELECT id,name,price_yen,stock FROM products WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE`, ids)
-	if err != nil {
-		return Order{}, err
-	}
-	products := make([]Product, 0, len(items))
-	for rows.Next() {
-		var p Product
-		if err := rows.Scan(&p.ID, &p.Name, &p.PriceYen, &p.Stock); err != nil {
-			rows.Close()
-			return Order{}, err
-		}
-		products = append(products, p)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return Order{}, err
-	}
-	if len(products) != len(items) {
-		return Order{}, errNotFound
-	}
-	for i, p := range products {
-		in := items[i]
-		item := OrderItem{ProductID: p.ID, ProductName: p.Name, Quantity: in.Quantity, PriceYen: p.PriceYen, StockShortage: p.Stock < in.Quantity}
-		item.SubtotalYen, err = addAmount(&o.TotalYen, p.PriceYen, in.Quantity)
-		if err != nil {
-			return Order{}, err
-		}
-		shortage = shortage || item.StockShortage
-		o.Items = append(o.Items, item)
-	}
-	orderStep(ctx, id, "all_products_locked")
-	reason := ""
-	if shortage {
-		reason = "out_of_stock"
-	} else {
-		if err := adjustOrderStock(ctx, tx, o.Items, -1); err != nil {
-			return Order{}, err
-		}
-		orderStep(ctx, id, "stock_reserved_in_transaction")
-		if payment == "fail" {
-			o.PaymentStatus = "failed"
-			reason = "payment_failed"
-		} else {
-			o.PaymentStatus = "succeeded"
-			if shipping == "fail" {
-				o.ShippingStatus = "failed"
-				o.PaymentStatus = "cancelled"
-				reason = "shipping_failed"
-			} else {
-				o.ShippingStatus = "requested"
-				o.Status = "shipping_requested"
-			}
-		}
-		if reason != "" {
-			if err := adjustOrderStock(ctx, tx, o.Items, 1); err != nil {
-				return Order{}, err
-			}
-			orderStep(ctx, id, "stock_restored_in_transaction")
-		}
-	}
-	if reason != "" {
-		o.FailureReason = &reason
-	}
-	err = tx.QueryRow(ctx, `INSERT INTO orders(id,status,failure_reason,payment_status,shipping_status) VALUES($1,$2,$3,$4,$5) RETURNING created_at`, id, o.Status, o.FailureReason, o.PaymentStatus, o.ShippingStatus).Scan(&o.CreatedAt)
-	if err != nil {
-		return Order{}, err
-	}
-	names := make([]string, len(o.Items))
-	quantities := make([]int32, len(o.Items))
-	prices := make([]int64, len(o.Items))
-	shortages := make([]bool, len(o.Items))
-	for i, item := range o.Items {
-		names[i], quantities[i], prices[i], shortages[i] = item.ProductName, int32(item.Quantity), item.PriceYen, item.StockShortage
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO order_items(order_id,product_id,product_name,quantity,price_yen,stock_shortage)
-		SELECT $1,product_id,product_name,quantity,price_yen,stock_shortage
-		FROM unnest($2::bigint[],$3::text[],$4::integer[],$5::bigint[],$6::boolean[])
-		AS item(product_id,product_name,quantity,price_yen,stock_shortage) ORDER BY product_id`,
-		id, ids, names, quantities, prices, shortages)
-	return o, err
-}
-
-// 呼出前に全商品のロックを取得済み。在庫確保と模擬失敗時の復元を同じSQLで扱う。
-func adjustOrderStock(ctx context.Context, tx pgx.Tx, items []OrderItem, direction int32) error {
-	ids := make([]int64, len(items))
-	deltas := make([]int32, len(items))
-	for i, item := range items {
-		ids[i], deltas[i] = item.ProductID, int32(item.Quantity)*direction
-	}
-	_, err := tx.Exec(ctx, `UPDATE products p SET stock=p.stock+i.delta
-		FROM unnest($1::bigint[],$2::integer[]) AS i(product_id,delta) WHERE p.id=i.product_id`, ids, deltas)
-	return err
+	return s.ResumeOrder(ctx, id)
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -49,7 +50,7 @@ func decodeCart(w http.ResponseWriter, r *http.Request, target any) error {
 	return nil
 }
 func registerCartHandlers(mux *http.ServeMux, s cartStore, logger *slog.Logger, wrap func(func(http.ResponseWriter, *http.Request, *string)) http.HandlerFunc) {
-	failure := func(w http.ResponseWriter, err error, orderID string) {
+	failure := func(ctx context.Context, w http.ResponseWriter, err error, orderID string) {
 		status, message := 503, "カート処理の結果を確認できませんでした。再取得してください。"
 		switch {
 		case errors.Is(err, errConflict):
@@ -63,9 +64,10 @@ func registerCartHandlers(mux *http.ServeMux, s cartStore, logger *slog.Logger, 
 		}
 		body := map[string]string{"error": message, "requestId": w.Header().Get("X-Request-ID")}
 		if status == 503 {
-			logger.Error("cart operation failed", "request_id", body["requestId"], "order_id", orderID, "error", err)
+			logger.ErrorContext(ctx, "cart operation failed", "request_id", body["requestId"], "service", "order", "order_id", orderID, "error", err)
 			if orderID != "" {
 				body["orderId"] = orderID
+				body["error"] = "注文・決済・配送の結果を確認できません。再注文せず、注文IDで状況を確認して処理を再開してください。"
 			}
 		}
 		writeJSON(w, status, body)
@@ -81,7 +83,7 @@ func registerCartHandlers(mux *http.ServeMux, s cartStore, logger *slog.Logger, 
 			}
 		}
 		if err != nil {
-			failure(w, err, "")
+			failure(r.Context(), w, err, "")
 			return
 		}
 		writeJSON(w, 200, map[string]any{"cart": c})
@@ -93,17 +95,17 @@ func registerCartHandlers(mux *http.ServeMux, s cartStore, logger *slog.Logger, 
 		}
 		err := decodeCart(w, r, &in)
 		if err != nil || in.Version == nil {
-			failure(w, errInvalid, "")
+			failure(r.Context(), w, errInvalid, "")
 			return
 		}
 		id, err := strconv.ParseInt(r.PathValue("productId"), 10, 64)
 		if err != nil {
-			failure(w, errInvalid, "")
+			failure(r.Context(), w, errInvalid, "")
 			return
 		}
 		c, err := s.SetCartItem(r.Context(), cartHash(r), *in.Version, id, in.Quantity, r.Method == "DELETE")
 		if err != nil {
-			failure(w, err, "")
+			failure(r.Context(), w, err, "")
 			return
 		}
 		writeJSON(w, 200, map[string]any{"cart": c})
@@ -117,13 +119,13 @@ func registerCartHandlers(mux *http.ServeMux, s cartStore, logger *slog.Logger, 
 			ShippingMode string `json:"shippingMode"`
 		}
 		if err := decodeCart(w, r, &in); err != nil || in.Version == nil {
-			failure(w, errInvalid, "")
+			failure(r.Context(), w, errInvalid, "")
 			return
 		}
 		*orderID = fmt.Sprintf("%x", randomID())
 		o, err := s.Checkout(r.Context(), cartHash(r), *in.Version, *orderID, in.PaymentMode, in.ShippingMode)
 		if err != nil {
-			failure(w, err, *orderID)
+			failure(r.Context(), w, err, *orderID)
 			return
 		}
 		w.Header().Set("Location", "/api/orders/"+o.ID)

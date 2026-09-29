@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"io"
 	"log/slog"
 	"mime"
@@ -33,6 +35,7 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func newHandler(store productStore, logger *slog.Logger) http.Handler {
+	logger = logger.With("service", "order")
 	mux := http.NewServeMux()
 	wrap := func(handler func(http.ResponseWriter, *http.Request, *string)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -46,7 +49,8 @@ func newHandler(store productStore, logger *slog.Logger) http.Handler {
 			ctx, cancel := context.WithTimeout(context.WithValue(r.Context(), requestIDKey{}, requestID), 3*time.Second)
 			defer cancel()
 			handler(rw, r.WithContext(ctx), &orderID)
-			logger.Info("http request", "request_id", requestID, "order_id", orderID,
+			trace.SpanFromContext(ctx).SetAttributes(attribute.String("order_id", orderID), attribute.String("request_id", requestID))
+			logger.InfoContext(ctx, "http request", "request_id", requestID, "order_id", orderID,
 				"method", r.Method, "path", r.URL.Path, "status", rw.status, "duration_ms", time.Since(started).Milliseconds())
 		}
 	}
@@ -60,7 +64,7 @@ func newHandler(store productStore, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /api/products", wrap(func(w http.ResponseWriter, r *http.Request, _ *string) {
 		products, err := store.ListProducts(r.Context())
 		if err != nil {
-			logger.Error("products query failed", "request_id", w.Header().Get("X-Request-ID"), "error", err)
+			logger.ErrorContext(r.Context(), "products query failed", "request_id", w.Header().Get("X-Request-ID"), "error", err)
 			fail(w, r, http.StatusServiceUnavailable, "商品を取得できませんでした。", "")
 			return
 		}
@@ -101,8 +105,8 @@ func newHandler(store productStore, logger *slog.Logger) http.Handler {
 			return
 		}
 		if err != nil {
-			logger.Error("create order failed", "request_id", w.Header().Get("X-Request-ID"), "order_id", *orderID, "error", err)
-			fail(w, r, http.StatusServiceUnavailable, "注文処理の結果を確認できません。再注文の前に注文IDで状況を確認してください。", *orderID)
+			logger.ErrorContext(r.Context(), "create order failed", "request_id", w.Header().Get("X-Request-ID"), "order_id", *orderID, "error", err)
+			fail(w, r, http.StatusServiceUnavailable, "注文・決済・配送の結果を確認できません。再注文せず、注文IDで状況を確認して処理を再開してください。", *orderID)
 			return
 		}
 		w.Header().Set("Location", "/api/orders/"+order.ID)
@@ -120,14 +124,36 @@ func newHandler(store productStore, logger *slog.Logger) http.Handler {
 			return
 		}
 		if err != nil {
-			logger.Error("get order failed", "request_id", w.Header().Get("X-Request-ID"), "order_id", *orderID, "error", err)
+			logger.ErrorContext(r.Context(), "get order failed", "request_id", w.Header().Get("X-Request-ID"), "order_id", *orderID, "error", err)
 			fail(w, r, http.StatusServiceUnavailable, "注文を取得できませんでした。", *orderID)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"order": order})
 	}))
+	if rs, ok := store.(interface {
+		ResumeOrder(context.Context, string) (Order, error)
+	}); ok {
+		mux.HandleFunc("POST /api/orders/{id}/resume", wrap(func(w http.ResponseWriter, r *http.Request, orderID *string) {
+			*orderID = r.PathValue("id")
+			var body struct{}
+			if !orderIDPattern.MatchString(*orderID) || decodeCart(w, r, &body) != nil {
+				fail(w, r, 400, "注文IDとリクエスト形式を確認してください。", "")
+				return
+			}
+			o, err := rs.ResumeOrder(r.Context(), *orderID)
+			if errors.Is(err, errNotFound) {
+				fail(w, r, 404, "注文が見つかりません。", *orderID)
+				return
+			}
+			if err != nil {
+				fail(w, r, 503, "結果を確認できません。在庫予約を保持しています。接続復旧後に同じ注文の処理を再開してください。", *orderID)
+				return
+			}
+			writeJSON(w, 200, map[string]any{"order": o})
+		}))
+	}
 	if cs, ok := store.(cartStore); ok {
 		registerCartHandlers(mux, cs, logger, wrap)
 	}
-	return mux
+	return tracedHTTP("order", mux)
 }

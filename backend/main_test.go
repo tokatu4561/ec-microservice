@@ -33,7 +33,7 @@ func TestProducts(t *testing.T) {
 		store  fakeStore
 		status int
 	}{
-		{"success", fakeStore{products: []Product{{1, "野菜セット", 980, 10}}}, http.StatusOK},
+		{"success", fakeStore{products: []Product{{1, "野菜セット", 980, 10, true}}}, http.StatusOK},
 		{"empty", fakeStore{}, http.StatusOK},
 		{"database failure", fakeStore{err: errors.New("private database details")}, http.StatusServiceUnavailable},
 	} {
@@ -82,11 +82,11 @@ func TestPostgresProducts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	products, err := (postgresStore{pool}).ListProducts(ctx)
+	products, err := (postgresStore{pool: pool, inventory: inventoryTestClient(t)}).ListProducts(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Product{{1, "旬の野菜セット", 980, 10}, {2, "北海道ミルク", 320, 20}, {3, "焼きたて食パン", 480, 0}}
+	want := []Product{{1, "旬の野菜セット", 980, 10, true}, {2, "北海道ミルク", 320, 20, true}, {3, "焼きたて食パン", 480, 0, true}}
 	if len(products) != len(want) {
 		t.Fatalf("products = %+v", products)
 	}

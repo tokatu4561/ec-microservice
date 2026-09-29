@@ -16,14 +16,16 @@ type CartItem struct {
 	PriceYen    int64  `json:"priceYen"`
 	Quantity    int    `json:"quantity"`
 	Stock       int    `json:"stock"`
+	StockKnown  bool   `json:"stockKnown"`
 	SubtotalYen int64  `json:"subtotalYen"`
 }
 type Cart struct {
-	Version     int64      `json:"version"`
-	Items       []CartItem `json:"items"`
-	TotalYen    int64      `json:"totalYen"`
-	ExpiresAt   time.Time  `json:"expiresAt"`
-	LastOrderID *string    `json:"lastOrderId"`
+	Version        int64      `json:"version"`
+	Items          []CartItem `json:"items"`
+	TotalYen       int64      `json:"totalYen"`
+	ExpiresAt      time.Time  `json:"expiresAt"`
+	PendingOrderID *string    `json:"pendingOrderId"`
+	LastOrderID    *string    `json:"lastOrderId"`
 }
 type cartStore interface {
 	NewCart(context.Context, string) (Cart, error)
@@ -34,14 +36,14 @@ type cartStore interface {
 
 func cartHeader(ctx context.Context, tx pgx.Tx, hash, lock string) (Cart, error) {
 	c := Cart{Items: []CartItem{}}
-	err := tx.QueryRow(ctx, `SELECT version,expires_at,last_order_id FROM carts WHERE token_hash=$1 AND expires_at>CURRENT_TIMESTAMP `+lock, hash).Scan(&c.Version, &c.ExpiresAt, &c.LastOrderID)
+	err := tx.QueryRow(ctx, `SELECT version,expires_at,last_order_id,pending_order_id FROM carts WHERE token_hash=$1 AND (expires_at>CURRENT_TIMESTAMP OR pending_order_id IS NOT NULL) `+lock, hash).Scan(&c.Version, &c.ExpiresAt, &c.LastOrderID, &c.PendingOrderID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, errNotFound
 	}
 	return c, err
 }
 func cartItems(ctx context.Context, tx pgx.Tx, hash string, c *Cart) error {
-	rows, err := tx.Query(ctx, `SELECT p.id,p.name,p.price_yen,ci.quantity,p.stock FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE cart_hash=$1 ORDER BY product_id`, hash)
+	rows, err := tx.Query(ctx, `SELECT p.id,p.name,p.price_yen,ci.quantity FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE cart_hash=$1 ORDER BY product_id`, hash)
 	if err != nil {
 		return err
 	}
@@ -50,7 +52,7 @@ func cartItems(ctx context.Context, tx pgx.Tx, hash string, c *Cart) error {
 	c.TotalYen = 0
 	for rows.Next() {
 		var item CartItem
-		if err = rows.Scan(&item.ProductID, &item.ProductName, &item.PriceYen, &item.Quantity, &item.Stock); err != nil {
+		if err = rows.Scan(&item.ProductID, &item.ProductName, &item.PriceYen, &item.Quantity); err != nil {
 			return err
 		}
 		item.SubtotalYen, err = addAmount(&c.TotalYen, item.PriceYen, item.Quantity)
@@ -79,7 +81,10 @@ func (s postgresStore) GetCart(ctx context.Context, hash string) (Cart, error) {
 	if err = cartItems(ctx, tx, hash, &c); err != nil {
 		return c, err
 	}
-	return c, tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return c, err
+	}
+	return s.withCartStock(ctx, c), nil
 }
 func (s postgresStore) SetCartItem(ctx context.Context, hash string, version, productID int64, quantity int, remove bool) (Cart, error) {
 	if version < 0 || productID <= 0 || (!remove && (quantity <= 0 || quantity > 2147483647)) {
@@ -94,7 +99,7 @@ func (s postgresStore) SetCartItem(ctx context.Context, hash string, version, pr
 	if err != nil {
 		return c, err
 	}
-	if c.Version != version {
+	if c.Version != version || c.PendingOrderID != nil {
 		return c, errConflict
 	}
 	if remove {
@@ -123,9 +128,14 @@ func (s postgresStore) SetCartItem(ctx context.Context, hash string, version, pr
 	if _, err = tx.Exec(ctx, `UPDATE carts SET version=$2 WHERE token_hash=$1`, hash, c.Version); err != nil {
 		return c, err
 	}
-	return c, tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return c, err
+	}
+	return s.withCartStock(ctx, c), nil
 }
-func (s postgresStore) Checkout(ctx context.Context, hash string, version int64, id, payment, shipping string) (Order, error) {
+func (s postgresStore) Checkout(ctx context.Context, hash string, version int64, id, payment, shipping string) (out Order, resultErr error) {
+	ctx, span := startOperation(ctx, "order", "order.checkout", id)
+	defer func() { finishOperation(span, resultErr) }()
 	if version < 0 {
 		return Order{}, errInvalid
 	}
@@ -141,7 +151,7 @@ func (s postgresStore) Checkout(ctx context.Context, hash string, version int64,
 	if err != nil {
 		return Order{}, err
 	}
-	if c.Version != version {
+	if c.Version != version || c.PendingOrderID != nil {
 		return Order{}, errConflict
 	}
 	rows, err := tx.Query(ctx, `SELECT product_id,quantity FROM cart_items WHERE cart_hash=$1 ORDER BY product_id`, hash)
@@ -165,7 +175,7 @@ func (s postgresStore) Checkout(ctx context.Context, hash string, version int64,
 	if len(items) == 0 {
 		return Order{}, errEmptyCart
 	}
-	o, err := createOrderTx(ctx, tx, id, items, payment, shipping)
+	o, err := reserveOrderTx(ctx, tx, id, items, payment, shipping, hash)
 	if err != nil {
 		return Order{}, err
 	}
@@ -175,12 +185,40 @@ func (s postgresStore) Checkout(ctx context.Context, hash string, version int64,
 		}
 	}
 	// 失敗注文も処理済みの版とする。同じ版での二重送信を受け付けない。
-	if _, err = tx.Exec(ctx, `UPDATE carts SET version=version+1,last_order_id=$2 WHERE token_hash=$1`, hash, id); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE carts SET version=version+1,last_order_id=$2,pending_order_id=$3 WHERE token_hash=$1`, hash, id, func() *string {
+		if o.Status == "processing" {
+			return &id
+		}
+		return nil
+	}()); err != nil {
 		return Order{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return Order{}, err
 	}
-	orderStep(ctx, id, "order_and_cart_committed")
-	return o, nil
+	orderStep(ctx, id, "order_and_cart_reserved")
+	if o.Status == "failed" {
+		return o, nil
+	}
+	return s.ResumeOrder(ctx, id)
+}
+
+// 在庫照会はOrderのTX終了後。取得できない場合もカート更新の成功を失敗扱いにしない。
+func (s postgresStore) withCartStock(ctx context.Context, c Cart) Cart {
+	if s.inventory == nil {
+		return c
+	}
+	ids := make([]int64, len(c.Items))
+	for i, item := range c.Items {
+		ids[i] = item.ProductID
+	}
+	stocks, err := s.inventory.Stocks(ctx, ids)
+	if err != nil {
+		return c
+	}
+	for i := range c.Items {
+		c.Items[i].Stock = stocks[c.Items[i].ProductID]
+		c.Items[i].StockKnown = true
+	}
+	return c
 }

@@ -86,9 +86,9 @@ export default function Home() {
       <ul className="products">{products.map((p) => <li className="product" key={p.id}>
         <span className="product-label">まいにちの定番</span><h2>{p.name}</h2>
         <p className="price">¥{p.priceYen.toLocaleString("ja-JP")}<span>税込</span></p>
-        <p className={p.stock > 0 ? "stock" : "stock sold-out"}>{p.stock > 0 ? `在庫 ${p.stock} 点` : "在庫なし"}</p>
+        <p className={p.stock > 0 ? "stock" : "stock sold-out"}>{!p.stockKnown ? "在庫確認不可" : p.stock > 0 ? `在庫 ${p.stock} 点` : "在庫なし"}</p>
         <form onSubmit={(e) => { e.preventDefault(); const current = cart?.items.find((i) => i.productId === p.id)?.quantity ?? 0; void change(p.id, current + Number(quantities[p.id] ?? "1")); }}>
-          <fieldset disabled={busy || !cart}>
+          <fieldset disabled={busy || !cart || !!cart.pendingOrderId}>
             <label htmlFor={`add-${p.id}`}>{p.name}の追加数量</label>
             <input id={`add-${p.id}`} type="number" min="1" max="2147483647" step="1" required value={quantities[p.id] ?? "1"} onChange={(e) => setQuantities({ ...quantities, [p.id]: e.target.value })} />
             <button type="submit">カートに追加</button>
@@ -99,12 +99,13 @@ export default function Home() {
       <section id="cart" className="panel" aria-labelledby="cart-heading">
         <h2 id="cart-heading">カート</h2>
         <p className="intro">同じブラウザーで30日間保存されます。在庫は注文確定時に確認します。</p>
+        {cart?.pendingOrderId && <p className="notice">処理中の注文があるためカートの変更・再注文はできません。<Link href={`/orders/${cart.pendingOrderId}`}>注文を確認・再開する</Link></p>}
         {cart?.items.length === 0 && <p>カートは空です。</p>}
         <ul className="cart-items">{cart?.items.map((item) => <li key={item.productId}>
-          <div><h3>{item.productName}</h3><p>単価 ¥{item.priceYen.toLocaleString("ja-JP")} · 在庫 {item.stock}点</p>
-            <p>小計 ¥{item.subtotalYen.toLocaleString("ja-JP")}</p>{item.quantity > item.stock && <p className="sold-out">在庫が不足しています。</p>}</div>
+          <div><h3>{item.productName}</h3><p>単価 ¥{item.priceYen.toLocaleString("ja-JP")} · {item.stockKnown ? `在庫 ${item.stock}点` : "在庫確認不可"}</p>
+            <p>小計 ¥{item.subtotalYen.toLocaleString("ja-JP")}</p>{!cart?.pendingOrderId && item.stockKnown && item.quantity > item.stock && <p className="sold-out">在庫が不足しています。</p>}</div>
           <form onSubmit={(e) => { e.preventDefault(); void change(item.productId, Number(edits[item.productId] ?? item.quantity)); }}>
-            <fieldset disabled={busy}>
+            <fieldset disabled={busy || !!cart?.pendingOrderId}>
               <label htmlFor={`cart-${item.productId}`}>{item.productName}のカート数量</label>
               <input id={`cart-${item.productId}`} type="number" min="1" max="2147483647" step="1" required value={edits[item.productId] ?? String(item.quantity)} onChange={(e) => setEdits({ ...edits, [item.productId]: e.target.value })} />
               <div className="cart-actions"><button type="submit">数量を変更</button><button type="button" onClick={() => change(item.productId, 0, true)}>削除</button></div>
@@ -113,7 +114,7 @@ export default function Home() {
         </li>)}</ul>
         <p className="price">見積合計 ¥{(cart?.totalYen ?? 0).toLocaleString("ja-JP")}<span>税込</span></p>
         <p className="learning-note">単価は注文確定時の商品価格で決まります。数量の変更は「数量を変更」で反映してください。</p>
-        <form onSubmit={checkout}><fieldset disabled={busy || !cart?.items.length}>
+        <form onSubmit={checkout}><fieldset disabled={busy || !cart?.items.length || !!cart.pendingOrderId}>
           <fieldset className="mock-settings"><legend>模擬処理（注文全体・学習用）</legend>
             <p>実際の決済・配送は行いません。1商品でも在庫不足なら全体が不成立になります。</p>
             <div className="form-row"><label htmlFor="payment">模擬決済<select id="payment" value={payment} onChange={(e) => setPayment(e.target.value)}><option value="success">成功</option><option value="fail">失敗</option></select></label>
