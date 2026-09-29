@@ -15,12 +15,28 @@ jobs:
       - uses: actions/checkout@v4
       - name: Go tests, cart concurrency, migration, race, vet and build
         run: docker compose --profile test run --build --rm api-test
+      - name: Payment unit and database tests, race, vet and build
+        run: docker compose --profile test run --build --rm payment-test
+      - name: Shipping unit and database tests, race, vet and build
+        run: docker compose --profile test run --build --rm shipping-test
+      - name: Inventory API, concurrency, import, race, vet and build
+        run: docker compose --profile test run --build --rm inventory-test
       - name: Frontend typecheck, lint and production build
         run: docker compose build web
       - name: Start application and check database connectivity through Next.js
         run: docker compose up --build --wait --wait-timeout 120
       - name: Verify anonymous carts, multi-item checkout, failures and legacy API
         run: python3 scripts/smoke.py
+      - name: Verify Payment API and persistence
+        run: python3 scripts/payment_smoke.py --lifecycle
+      - name: Verify Order to Payment flow and unavailable dependency
+        run: python3 scripts/order_payment_smoke.py --lifecycle
+      - name: Verify cross-service traces, latency, timeout and recovery
+        run: python3 scripts/tracing_demo.py --project ec-learning --base-url http://127.0.0.1:3000 --jaeger-url http://127.0.0.1:16686
+      - name: Verify Shipping flow, restart and traces
+        run: python3 scripts/shipping_demo.py --lifecycle
+      - name: Inventory recovery and four-service tracing
+        run: python3 scripts/inventory_demo.py --lifecycle
       - name: Show logs
         if: always()
         run: docker compose --profile test logs --no-color --tail 100

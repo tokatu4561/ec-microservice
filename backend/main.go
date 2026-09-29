@@ -15,10 +15,11 @@ import (
 )
 
 type Product struct {
-	ID       int64  `json:"id"`
-	Name     string `json:"name"`
-	PriceYen int64  `json:"priceYen"`
-	Stock    int    `json:"stock"`
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	PriceYen   int64  `json:"priceYen"`
+	Stock      int    `json:"stock"`
+	StockKnown bool   `json:"stockKnown"`
 }
 
 type productStore interface {
@@ -27,11 +28,16 @@ type productStore interface {
 	GetOrder(context.Context, string) (Order, error)
 }
 
-type postgresStore struct{ pool *pgxpool.Pool }
+type postgresStore struct {
+	pool      *pgxpool.Pool
+	payments  paymentGateway
+	shipping  shippingGateway
+	inventory inventoryGateway
+}
 
 func (s postgresStore) ListProducts(ctx context.Context) ([]Product, error) {
 	// 商品データの読み取りはGoが担当する。金額は整数の円で扱う。
-	rows, err := s.pool.Query(ctx, `SELECT id, name, price_yen, stock FROM products ORDER BY id`)
+	rows, err := s.pool.Query(ctx, `SELECT id, name, price_yen FROM products ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -39,12 +45,28 @@ func (s postgresStore) ListProducts(ctx context.Context) ([]Product, error) {
 	products := make([]Product, 0)
 	for rows.Next() {
 		var p Product
-		if err := rows.Scan(&p.ID, &p.Name, &p.PriceYen, &p.Stock); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.PriceYen); err != nil {
 			return nil, err
 		}
 		products = append(products, p)
 	}
-	return products, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	ids := make([]int64, len(products))
+	for i, p := range products {
+		ids[i] = p.ID
+	}
+	if s.inventory != nil {
+		if stocks, e := s.inventory.Stocks(ctx, ids); e == nil {
+			for i := range products {
+				products[i].Stock = stocks[products[i].ID]
+				products[i].StockKnown = true
+			}
+		}
+	}
+	return products, nil
 }
 
 func randomID() []byte {
@@ -57,9 +79,26 @@ func randomID() []byte {
 func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTracing, err := initTracing(ctx, "order")
+	if err != nil {
+		return fmt.Errorf("initialize tracing: %w", err)
+	}
+	defer shutdownTracing()
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
 		return fmt.Errorf("DATABASE_URL is required")
+	}
+	payments, err := newHTTPPayments(os.Getenv("PAYMENT_BASE_URL"))
+	if err != nil {
+		return err
+	}
+	shipping, err := newHTTPShipping(os.Getenv("SHIPPING_BASE_URL"))
+	if err != nil {
+		return err
+	}
+	inventory, err := newHTTPInventory(os.Getenv("INVENTORY_BASE_URL"))
+	if err != nil {
+		return err
 	}
 	pool, err := pgxpool.New(ctx, url)
 	if err != nil {
@@ -72,8 +111,12 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("connect database: %w", err)
 	}
+	var cutover bool
+	if err = pool.QueryRow(ctx, `SELECT singleton FROM inventory_cutover WHERE singleton`).Scan(&cutover); err != nil {
+		return fmt.Errorf("inventory migration required: %w", err)
+	}
 	server := &http.Server{
-		Addr: ":8080", Handler: newHandler(postgresStore{pool}, logger),
+		Addr: ":8080", Handler: newHandler(postgresStore{pool: pool, payments: payments, shipping: shipping, inventory: inventory}, logger),
 		ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 	}
 	errors := make(chan error, 1)
@@ -96,7 +139,7 @@ func run(logger *slog.Logger) error {
 }
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(traceLogHandler{slog.NewJSONHandler(os.Stdout, nil)})
 	slog.SetDefault(logger)
 	if err := run(logger); err != nil {
 		logger.Error("api stopped", "error", err)

@@ -246,7 +246,7 @@ func TestSameCartRacesPostgres(t *testing.T) {
 	}
 }
 func TestCartRollbackPostgres(t *testing.T) {
-	for _, stage := range []string{"after_stock_update", "during_items"} {
+	for _, stage := range []string{"before_inventory_request", "during_items"} {
 		t.Run(stage, func(t *testing.T) {
 			s, a := orderFixture(t, 5)
 			_, b := orderFixture(t, 5)
@@ -254,7 +254,7 @@ func TestCartRollbackPostgres(t *testing.T) {
 			c = putTestItem(t, s, hash, c, a, 1)
 			c = putTestItem(t, s, hash, c, b, 2)
 			orderID := fmt.Sprintf("%x", randomID())
-			// 前者は全商品の在庫UPDATE後、後者は先頭明細INSERT後に失敗させる。
+			// 前者は注文INSERT時、後者は先頭明細INSERT後に失敗させる。どちらもInventory呼出し前。
 			table, condition := "orders", fmt.Sprintf("NEW.id = '%s'", orderID)
 			if stage == "during_items" {
 				table = "order_items"

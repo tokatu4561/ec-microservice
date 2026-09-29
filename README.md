@@ -21,7 +21,14 @@
 [同時注文と悲観ロックの実験](docs/learning2-concurrency.md)では、在庫10への同時注文20件の整合性と、DBで観測するロック待ちを扱います。
 [負荷試験とSQL一括化の比較](docs/learning2-load.md)では、k6で変更前後の処理件数・待ち時間と在庫の正しさを確認しました。
 残りの競合制御・過負荷・キャンセル検証は[AWSデプロイ後の検証 #10](https://github.com/tokatu4561/ec-microservice/issues/10)へ引き継いでいます。
-次の学習は[学習3：注文フローのサービス分割 #4](https://github.com/tokatu4561/ec-microservice/issues/4)です。
+[学習3：注文フローのサービス分割 #4](https://github.com/tokatu4561/ec-microservice/issues/4)は、実装・障害検証・振り返りを終え、利用者が学習完了を確認しました。
+次は[学習4：冪等性・Outbox・Saga #5](https://github.com/tokatu4561/ec-microservice/issues/5)で、非同期連携と自動復旧を扱います。
+最初の単位は[Paymentを独立して動かす](docs/learning3-payment.md)です。
+専用DBを持つ模擬決済サービスの作成・照会・取消、再起動と単独停止を扱います。
+[同期HTTP連携](docs/learning3-order-payment.md)に続き、[短いトランザクションと注文の手動復旧](docs/learning3-order-recovery.md)まで実装しています。
+現在は通信前に注文と進行段階を保存し、通信中のDBロックを解放します。[OpenTelemetryとJaegerのデモ](docs/learning3-tracing.md)で、サービス間の時間・障害・再開を可視化できます。通常環境のJaegerは http://localhost:16686 です。
+
+Shippingも専用DBを持つ別サービスへ分離しました。[Shippingの設計・障害復旧デモ](docs/learning3-shipping.md)で、決済成功後の配送結果不明と手動再開を確認できます。Inventoryも別サービスへ分離済みです。[現行の4サービス構成](docs/learning3-inventory.md)を参照してください。
 
 実装・検証後は、親エージェントが[レビュー担当](.codex/agents/reviewer.toml)を起動し、結果を受け取ります。
 毎回のレビュー依頼や、指摘の手動コピーは原則不要です。修正・再検証は親が担当します。
@@ -32,7 +39,8 @@ reviewerは編集せず、テスト不足も確認します。テスト作成・
 ## 学習1：ローカルECの注文フロー
 
 [Issue #2](https://github.com/tokatu4561/ec-microservice/issues/2)の実装です。
-Goの単一バックエンドとPostgreSQLで、商品一覧・注文・在庫確保・模擬決済・模擬配送・注文状況を扱います。
+学習1ではGoの単一バックエンドとPostgreSQLで、商品一覧・注文・在庫確保・模擬決済・模擬配送・注文状況を実装しました。
+現在は学習3の変更で決済・配送・在庫が専用サービス・専用DBに分かれています。
 Next.jsは画面とAPI転送を担当します。実際の支払いや配送は発生しません。
 
 ### 起動・停止
@@ -48,6 +56,8 @@ docker info
 ```
 
 リポジトリのルートで実行します。初回は公式イメージとパッケージを取得します。
+既存環境を更新する場合は先に `docker compose stop api web` で旧Orderを停止してください。
+在庫のオフライン移行を行うため、新旧Orderの混在運用はできません。
 
 ```sh
 docker compose up --build --wait --wait-timeout 120
@@ -55,7 +65,8 @@ docker compose up --build --wait --wait-timeout 120
 
 [商品一覧](http://localhost:3000)を開きます。3000番ポートを使用中なら
 `WEB_PORT=3001 docker compose up --build --wait`として3001番を開きます。
-画面だけを127.0.0.1へ公開し、Go・DBにはCompose内部から接続します。固定のDB認証情報はローカル学習用です。
+画面を127.0.0.1へ公開し、既存Go・DBにはCompose内部から接続します。
+学習3のPayment APIは別途127.0.0.1:8081へ公開します（`PAYMENT_PORT`で変更可能）。固定のDB認証情報はローカル学習用です。
 
 ```sh
 docker compose down
@@ -67,7 +78,7 @@ docker compose up --wait
 `migrate`サービスが注文テーブルの追加SQLを実行し、成功してからAPIを起動します。
 追加SQLは再実行可能です。003で既存注文を1明細の注文へ移し、ID・日時・状態・当時の名称と価格・在庫を保持します。
 
-初期商品を再投入する場合は以下です。既存IDの価格・在庫・注文は変更しません。
+以下は旧教材の商品初期投入SQLです。Inventory移行後の在庫補充には使えません。商品追加・補充APIは未実装です。
 
 ```sh
 docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ec -d ec < db/init/001_products.sql
@@ -108,23 +119,24 @@ docker compose up --wait
   → BEGIN
   → カート行を FOR UPDATE、バージョンを確認
   → 対象商品を商品ID昇順で SELECT ... FOR UPDATE
-  → 在庫不足なら失敗状態を決定
-  → 在庫があれば確保 → 模擬決済 → 模擬配送
-  → 模擬失敗なら在庫を戻す
-  → ordersに全体状態、order_itemsに全明細をINSERT
-  → 成功時にカートを空にし、成功・業務失敗ともバージョンを更新
-  → COMMIT → JSONで注文を返す → 画面で表示
+  → 注文・明細・inventory_pendingを保存し、カートを処理中にする
+  → COMMIT（DB接続・ロックを解放）
+  → Inventoryを照会・予約（HTTP）。在庫不足なら決済を呼ばず失敗
+  → 段階を保存し、Paymentを照会・決済（HTTP）
+  → Shippingの配送依頼を照会・作成（HTTP）
+  → 明確な配送受付失敗なら取消待ちを保存して、Paymentの取消APIを呼ぶ
+  → Inventoryの予約を確定／解除（HTTP）
+  → 短い別トランザクションで注文・カートを確定
+  → 結果不明なら予約を保持し、同じ注文から手動で再開
 ```
 
-`backend/http.go`の`newHandler`がHTTPの入口、`backend/cart.go`の`Checkout`と`backend/orders.go`の`createOrderTx`が一括注文処理です。
-`pgx.Tx`内のSQLはすべて同じDBトランザクションに属し、途中でDBエラーが出るとロールバックします。
-`defer`で後始末を予約し、リクエストがキャンセルされても別の短い猶予でロールバックを試みます。
-
-業務上の失敗（在庫不足・模擬失敗）は注文履歴としてコミットします。
-DBの途中エラーでは在庫と注文の部分更新を残しません。
-ただしCOMMIT応答やHTTP応答が失われた場合、呼出側には保存済みか分からないことがあります。
-この場合は自動再送せず、返された注文IDで照会するか、リクエストID・注文IDとDBを照合してください。
-この学習では実外部サービスを呼ばないため、模擬決済取消も同一DB内の状態変更です。実決済の返金をDBロールバックだけで解決できるという意味ではありません。
+HTTPの入口は`backend/http.go`、受付は`backend/cart.go`の`Checkout`と`backend/orders.go`の`CreateOrder`です。
+`backend/order_progress.go`が在庫予約、Payment／Shipping通信、確定を分離します。
+通信中にはDBトランザクションを保持しません。在庫不足ではPaymentを呼ばず失敗を保存します。
+予約の結果不明では注文を保持し、Paymentを呼ばずに再開を待ちます。
+保存後の通信・確定失敗では注文と予約が残るため、注文詳細の「処理を再開」から続行します。
+取消待ちも永続化し、Inventoryは予約行ロックで数量を一度だけ戻し、Orderは段階の比較更新と注文行ロックで進行・カートを確定します。
+実際の課金・返金・配送は行いません。自動復旧、予約の自動期限切れ、旧実験で作った孤立決済の移行は対象外です。
 
 ```sh
 curl -i http://localhost:3000/api/products
@@ -135,13 +147,13 @@ curl -i http://localhost:3000/api/orders \
 curl -i http://localhost:3000/api/orders/注文ID
 
 docker compose logs --tail 50 api
-docker compose exec db psql -U ec -d ec -c 'SELECT id, name, price_yen, stock FROM products ORDER BY id;'
+docker compose exec inventory-db psql -U inventory -d inventory -c 'SELECT product_id, available FROM stocks ORDER BY product_id;'
 docker compose exec db psql -U ec -d ec -c 'SELECT id, status, failure_reason, payment_status, shipping_status FROM orders ORDER BY created_at;'
 ```
 
 `X-Request-ID`をログの`request_id`と照合し、`order_id`で注文処理を追います。
-`stock_reserved_in_transaction`や`stock_restored_in_transaction`はまだ確定前の操作です。
-単品の`order_committed`、カートの`order_and_cart_committed`がコミット応答を受け取った記録です。`order_not_committed_by_application`はアプリがコミット成功を確認できなかった記録であり、通信障害時のDB上の未保存を断定するものではありません。
+`inventory_call_finished`・`payment_call_finished`・`shipping_call_finished`で外部呼び出しの結果を追います。
+`order_finalized`は注文確定後の記録です。通信失敗では相手DBの未保存とは断定せず、同じ注文IDで照会します。
 定期的な商品取得ログはComposeのヘルスチェックでも発生します。
 
 ### APIの契約
@@ -155,7 +167,7 @@ docker compose exec db psql -U ec -d ec -c 'SELECT id, status, failure_reason, p
 POSTは`productId`・`quantity`を必須とし、`paymentMode`・`shippingMode`に`success`または`fail`を受け取ります。
 模擬モードの省略時は成功です。未知のJSONフィールド・複数JSON・4096バイトを超える本文を拒否します。
 失敗履歴も保存されるため、業務上の失敗でもHTTPは201です。`order.status`と`failureReason`で業務結果を判断します。
-注文状態は`shipping_requested`または`failed`、失敗理由は`out_of_stock`・`payment_failed`・`shipping_failed`です。
+注文状態は`processing`（確認待ち）・`cancel_pending`（決済取消待ち）・`shipping_requested`（配送依頼済み）・`failed`（失敗）、失敗理由は`out_of_stock`・`payment_failed`・`shipping_failed`です。
 
 ### 検証を再実行する
 
@@ -173,7 +185,7 @@ docker compose --profile test stop test-db
 PythonはHTTPスモークテストだけに使います。Go・Nodeの検証はコンテナ内で実行します。
 Goテストは正常・在庫不足・決済失敗・配送失敗、入力検証、注文時点の価格保持を確認します。
 在庫1への並行2注文では成功1件・失敗1件・在庫0を検証します。
-テスト専用DBのトリガーで在庫更新後の注文INSERTを失敗させ、在庫が元に戻り注文が残らないことも確認します。
+テスト専用DBのトリガーで注文保存失敗や予約後の進行更新失敗を再現し、外部処理前のロールバックと、外部処理後の安全な再開を確認します。
 通常の`go test`では`TEST_DATABASE_URL`未設定ならDB統合テストをスキップするため、上記Composeコマンドを使ってください。
 
 GitHub Actionsにも同じ検査とHTTP注文フローを定義しています。push未実施の間はリモートでの成功を未確認として扱います。
@@ -208,9 +220,20 @@ DB停止時のエラーを試すには`docker compose stop db`後に画面を再
 各明細は`productId, productName, quantity, priceYen, subtotalYen, stockShortage`を持ちます。
 
 カート行を先にロックし、商品行を常にID昇順でロックすることで、逆順の商品を注文しても循環待ちを防ぎます。
-Read Committedの同一トランザクションで全商品の確認・在庫更新・模擬処理・注文保存・カート消去を行います。
-DB途中エラーではすべてロールバックします。業務失敗では失敗注文をコミットし、カートを維持してバージョンを進めます。
-`cart.lastOrderId`で直近の注文を確認できます。汎用的な冪等性キーや実決済は対象外です。
+Orderの短いトランザクションで商品情報と注文を保存します。在庫予約は別HTTP要求とInventory側のトランザクションで行います。
+カートの版を受付時に1つ進め、`pendingOrderId`と`lastOrderId`へ注文IDを保存します。
+処理中のカートは編集・再注文とも409になります。確定後、成功時は内容を消去し、失敗時は内容を残します。
+処理中のカートは期限を過ぎても既存Cookieで照会できます。ただしCookie自体の期限後の再発行・所有者復旧機能はありません。
+`POST /api/orders/{id}/resume`は本文`{}`と上記2ヘッダーを指定します。確定済みなら結果を返すだけです。
+復旧は同じ注文IDを使用します。別の新規注文要求に対する汎用的な冪等性キーは未実装です。
 
 DB統合テストには、逆順の複数商品並行注文、同じカートへの競合更新と注文、全商品更新後と明細保存途中のDBエラー、
 匿名Cookieの分離・期限切れ、旧注文の移行・再実行・空DB構築も含みます。CIも同じComposeテストと更新したスモークテストを実行します。
+
+### 学習3：Inventoryの分離
+
+現在はOrder・Payment・Shipping・Inventoryの4サービス。Inventoryが販売可能数と予約を所有します。
+Orderは処理段階を永続化し、通信断後は同じ注文の「処理を再開」で復旧します。
+在庫照会不能は画面に「在庫確認不可」と表示します。
+[設計図・移行の注意・停止復旧と4サービスのトレースのデモ](docs/learning3-inventory.md)を参照してください。
+既存環境の更新前には旧Orderを停止してください。`inventory-import`が在庫と保留予約を一度だけ移行します。

@@ -128,13 +128,14 @@ func orderFixture(t *testing.T, stock int) (postgresStore, int64) {
 			t.Error(err)
 		}
 	})
-	return postgresStore{pool}, id
+	seedInventory(t, id, stock)
+	return postgresStore{pool: pool, payments: simulatedPayments{}, shipping: simulatedShipping{}, inventory: inventoryTestClient(t)}, id
 }
 
 func checkStock(t *testing.T, s postgresStore, productID int64, want int) {
 	t.Helper()
 	var stock int
-	if err := s.pool.QueryRow(context.Background(), `SELECT stock FROM products WHERE id=$1`, productID).Scan(&stock); err != nil {
+	if err := inventoryTestDB(t).QueryRow(context.Background(), `SELECT available FROM stocks WHERE product_id=$1`, productID).Scan(&stock); err != nil {
 		t.Fatal(err)
 	}
 	if stock != want {
@@ -197,7 +198,7 @@ func TestOrderOutcomesPostgres(t *testing.T) {
 
 func TestOrderRollbackPostgres(t *testing.T) {
 	s, id := orderFixture(t, 3)
-	// テスト専用DBのトリガーで、在庫UPDATE後の注文INSERTを失敗させる。
+	// テスト専用DBのトリガーで、Inventory呼出し前の注文INSERTを失敗させる。
 	_, err := s.pool.Exec(context.Background(), fmt.Sprintf(`
 	CREATE FUNCTION test_reject_order() RETURNS trigger LANGUAGE plpgsql AS $$
 	BEGIN IF NEW.product_id = %d THEN RAISE EXCEPTION 'injected order insert failure'; END IF; RETURN NEW; END $$;
